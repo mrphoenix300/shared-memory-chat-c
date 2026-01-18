@@ -50,8 +50,6 @@ To build the project, simply run:
 make
 ```
 
-````
-
 This will compile the source code and place the executable in the `build/` directory.
 
 ### Usage
@@ -76,4 +74,3 @@ Run the application:
 ---
 
 _This software is provided for educational purposes._
-````
