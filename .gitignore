@@ -1,0 +1,17 @@
+# Compiled Object files
+*.o
+
+# Build directory
+build/
+
+# Executables (in case they are outside build)
+chat_app
+chat
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor directories (VS Code, etc)
+.vscode/
+.idea/
