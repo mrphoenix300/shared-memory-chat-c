@@ -24,55 +24,73 @@ void *reader(void *arg) {
     ChatRoom *myRoom = &shm_ptr->rooms[current_room_id];
 
     // initial synchronization
-    sem_wait(&myRoom->mutex);
+    pthread_mutex_lock(&myRoom->mutex);
     local_seq = myRoom->global_seq_count;
-    sem_post(&myRoom->mutex);
+    pthread_mutex_unlock(&myRoom->mutex);
 
     while (running) {
-        usleep(100000); // 100ms sleep for cpu save
+        pthread_mutex_lock(&myRoom->mutex); // enters critical section
 
-        sem_wait(&myRoom->mutex); // enters critical section
+        // wait for a new message to arrive
+        while (local_seq >= myRoom->global_seq_count && running) {
+            pthread_cond_wait(&myRoom->new_msg_cond, &myRoom->mutex);
+        }
 
-        if (local_seq < myRoom->global_seq_count) {
-            
-            // we search for the message in the buffer of that room
-            int target_id = local_seq + 1;
-            int found_idx = -1;
-            
-            for(int i=0; i<MAX_MSGS; i++) {
-                if(myRoom->messages[i].id == target_id) {
-                    found_idx = i;
-                    break;
-                }
-            }
+        if (!running) {
+            pthread_mutex_unlock(&myRoom->mutex);
+            break;
+        }
 
-            if (found_idx != -1) {
-                Message *msg = &myRoom->messages[found_idx];
-
-                if (strcmp(msg->payload, "TERMINATE") == 0) { // terminates when the user enter "TERMINATE" message
-                    printf("\n[System]: Received TERMINATE signal in Room %d. Shutting down...\n", current_room_id);
-                    running = 0; 
-                    if (msg->readers_left > 0) msg->readers_left--; // has been read
-                    sem_post(&myRoom->mutex);
-                    pthread_exit(NULL);
-                }
-
-                if (msg->sender_pid != my_pid) {
-                    printf("\r[User %d]: %s\n", msg->sender_pid, msg->payload);
-                    printf("You (Room %d): ", current_room_id); 
-                    fflush(stdout);
-                }
-
-                if (msg->readers_left > 0) {
-                    msg->readers_left--; // has been read
-                }
-                
-                local_seq++; 
-            } else {
-                local_seq++;
+        // we search for the message in the buffer of that room
+        int target_id = local_seq + 1;
+        int found_idx = -1;
+        
+        for(int i=0; i<MAX_MSGS; i++) {
+            if(myRoom->messages[i].id == target_id) {
+                found_idx = i;
+                break;
             }
         }
-        sem_post(&myRoom->mutex); // leaves critical section
+
+        if (found_idx != -1) {
+            Message *msg = &myRoom->messages[found_idx];
+
+            if (strcmp(msg->payload, "TERMINATE") == 0) { // terminates when the user enter "TERMINATE" message
+                printf("\n[System]: Received TERMINATE signal in Room %d. Shutting down...\n", current_room_id);
+                running = 0; 
+                
+                if (msg->readers_left > 0) {
+                    msg->readers_left--; // has been read
+                    if (msg->readers_left == 0) {
+                        pthread_cond_signal(&myRoom->space_cond); // notify writer
+                    }
+                }
+                
+                // wake up others just in case they are stuck waiting
+                pthread_cond_broadcast(&myRoom->new_msg_cond);
+                pthread_mutex_unlock(&myRoom->mutex);
+                pthread_exit(NULL);
+            }
+
+            if (msg->sender_pid != my_pid) {
+                printf("\r[User %d]: %s\n", msg->sender_pid, msg->payload);
+                printf("You (Room %d): ", current_room_id); 
+                fflush(stdout);
+            }
+
+            if (msg->readers_left > 0) {
+                msg->readers_left--; // has been read
+                if (msg->readers_left == 0) {
+                    pthread_cond_signal(&myRoom->space_cond); // notify writer that space is free
+                }
+            }
+            
+            local_seq++; 
+        } else {
+            local_seq++;
+        }
+        
+        pthread_mutex_unlock(&myRoom->mutex); // leaves critical section
     }
     return NULL;
 }
@@ -106,19 +124,37 @@ int main(int argc, char *argv[]) {
         shm_ptr = mmap(NULL, sizeof(SharedSegment), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
         if (shm_ptr == MAP_FAILED) { perror("mmap"); exit(1); }
 
+        // setup attributes for inter-process sharing
+        pthread_mutexattr_t mattr;
+        pthread_condattr_t cattr;
+        
+        pthread_mutexattr_init(&mattr);
+        pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+        
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
+
+        // initialization of all chat rooms
         // initialization of all chat rooms
         for(int i = 0; i < MAX_ROOMS; i++) {
-            sem_init(&shm_ptr->rooms[i].mutex, 1, 1);
+            pthread_mutex_init(&shm_ptr->rooms[i].mutex, &mattr);
+            pthread_cond_init(&shm_ptr->rooms[i].new_msg_cond, &cattr);
+            pthread_cond_init(&shm_ptr->rooms[i].space_cond, &cattr);
+            
             shm_ptr->rooms[i].active_participants = 0;
             shm_ptr->rooms[i].head = 0;
             shm_ptr->rooms[i].global_seq_count = 0;
             memset(shm_ptr->rooms[i].messages, 0, sizeof(shm_ptr->rooms[i].messages));
         }
 
+        // cleanup attributes
+        pthread_mutexattr_destroy(&mattr);
+        pthread_condattr_destroy(&cattr);
+
         // enter the chat room I have selected
-        sem_wait(&shm_ptr->rooms[current_room_id].mutex);
+        pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
         shm_ptr->rooms[current_room_id].active_participants++;
-        sem_post(&shm_ptr->rooms[current_room_id].mutex);
+        pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);
         
         printf("Initialized %d rooms. Joined Room %d as Creator.\n", MAX_ROOMS, current_room_id);
 
@@ -132,9 +168,9 @@ int main(int argc, char *argv[]) {
             if (shm_ptr == MAP_FAILED) { perror("mmap"); exit(1); }
 
             // enter the chat room I have selected
-            sem_wait(&shm_ptr->rooms[current_room_id].mutex);
+            pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
             shm_ptr->rooms[current_room_id].active_participants++;
-            sem_post(&shm_ptr->rooms[current_room_id].mutex);
+            pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);  
             
             printf("Joined existing Shared Memory. Entered Room %d.\n", current_room_id);
 
@@ -164,19 +200,24 @@ int main(int argc, char *argv[]) {
 
         if (strlen(buffer) == 0) continue;
 
-        sem_wait(&myRoom->mutex); // enters critical section
+        pthread_mutex_lock(&myRoom->mutex); // enters critical section
 
         if (!running) {
-            sem_post(&myRoom->mutex);
+            pthread_mutex_unlock(&myRoom->mutex);
             break;
         }
 
         // check if full
         int idx = myRoom->head;
-        if (myRoom->messages[idx].readers_left > 0) {
-            printf("[System]: Buffer full in Room %d. Wait for readers.\n", current_room_id);
-            sem_post(&myRoom->mutex);
-            continue;
+       // check if full and wait for readers
+        while (myRoom->messages[idx].readers_left > 0 && running) {
+            // blocks until space_cond is signaled by a reader
+            pthread_cond_wait(&myRoom->space_cond, &myRoom->mutex);
+        }
+
+        if (!running) {
+            pthread_mutex_unlock(&myRoom->mutex);
+            break;
         }
 
         // write payload
@@ -196,7 +237,10 @@ int main(int argc, char *argv[]) {
             printf("[System]: You sent TERMINATE. Exiting...\n");
         }
 
-        sem_post(&myRoom->mutex); // leaves critical section
+        // wake up ALL waiting readers simultaneously
+        pthread_cond_broadcast(&myRoom->new_msg_cond);
+
+        pthread_mutex_unlock(&myRoom->mutex); // leaves critical section
     }
 
     // cleanup
@@ -204,9 +248,9 @@ int main(int argc, char *argv[]) {
     pthread_join(reader_tid, NULL);
 
     // decrement participants only for my room
-    sem_wait(&myRoom->mutex);
+    pthread_mutex_lock(&myRoom->mutex);
     myRoom->active_participants--;
-    sem_post(&myRoom->mutex);
+    pthread_mutex_unlock(&myRoom->mutex);
 
     // check cleanup
     int all_empty = are_all_rooms_empty(); // here we perform a check without a lock for simplicity, as unlink does not mind if it is done twice (the second time will fail)

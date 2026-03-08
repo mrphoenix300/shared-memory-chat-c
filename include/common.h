@@ -9,7 +9,6 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <semaphore.h>
 #include <pthread.h>
 #include <errno.h>
 
@@ -17,7 +16,6 @@
 #define MSG_SIZE 128
 #define MAX_MSGS 100
 #define MAX_ROOMS 10  // how many chat rooms supports
-
 
 // struct for a message
 typedef struct {
@@ -28,10 +26,12 @@ typedef struct {
 } Message;
 
 // struct for a chat room
-// every chat room have its own messages and mutex 
+// every chat room have its own messages, mutex and condition variables
 typedef struct {
-    sem_t mutex;                 // locks only for this chat room
-    Message messages[MAX_MSGS]; // buffer of chat room messages
+    pthread_mutex_t mutex;           // locks only for this chat room
+    pthread_cond_t new_msg_cond;     // condition for readers to wait
+    pthread_cond_t space_cond;       // condition for writer to wait if buffer is full
+    Message messages[MAX_MSGS];      // buffer of chat room messages
     int head;
     int global_seq_count;
     int active_participants;
