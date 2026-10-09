@@ -134,7 +134,9 @@ int main(int argc, char *argv[]) {
         pthread_condattr_init(&cattr);
         pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
 
-        // initialization of all chat rooms
+        pthread_mutex_init(&shm_ptr->lifecycle_mutex, &mattr);
+        shm_ptr->total_participants = 0;
+
         // initialization of all chat rooms
         for(int i = 0; i < MAX_ROOMS; i++) {
             pthread_mutex_init(&shm_ptr->rooms[i].mutex, &mattr);
@@ -152,9 +154,12 @@ int main(int argc, char *argv[]) {
         pthread_condattr_destroy(&cattr);
 
         // enter the chat room I have selected
+        pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
         pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
         shm_ptr->rooms[current_room_id].active_participants++;
+        shm_ptr->total_participants++;
         pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);
+        pthread_mutex_unlock(&shm_ptr->lifecycle_mutex);
         
         printf("Initialized %d rooms. Joined Room %d as Creator.\n", MAX_ROOMS, current_room_id);
 
@@ -176,9 +181,12 @@ int main(int argc, char *argv[]) {
             if (shm_ptr == MAP_FAILED) { perror("mmap"); exit(1); }
 
             // enter the chat room I have selected
+            pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
             pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
             shm_ptr->rooms[current_room_id].active_participants++;
-            pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);  
+            shm_ptr->total_participants++;
+            pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);
+            pthread_mutex_unlock(&shm_ptr->lifecycle_mutex);  
             
             printf("Joined existing Shared Memory. Entered Room %d.\n", current_room_id);
 
@@ -255,20 +263,24 @@ int main(int argc, char *argv[]) {
     pthread_cancel(reader_tid); 
     pthread_join(reader_tid, NULL);
 
-    // decrement participants only for my room
+    // Serialize joins and leaves across all rooms. The final participant
+    // unlinks while holding the lifecycle lock, preventing concurrent joins.
+    pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
     pthread_mutex_lock(&myRoom->mutex);
     myRoom->active_participants--;
     pthread_mutex_unlock(&myRoom->mutex);
-
-    // check cleanup
-    int all_empty = are_all_rooms_empty(); // here we perform a check without a lock for simplicity, as unlink does not mind if it is done twice (the second time will fail)
+    shm_ptr->total_participants--;
+    int all_empty = (shm_ptr->total_participants == 0);
+    if (all_empty && shm_unlink(SHM_NAME) == -1) {
+        perror("shm_unlink");
+    }
+    pthread_mutex_unlock(&shm_ptr->lifecycle_mutex);
 
     munmap(shm_ptr, sizeof(SharedSegment));
     close(shm_fd);
 
     if (all_empty) {
         printf("Last user of the ENTIRE system left. Removing Shared Memory.\n");
-        shm_unlink(SHM_NAME);
     } else {
         printf("Exited Room %d. System remains active for other rooms.\n", current_room_id);
     }
