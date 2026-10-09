@@ -1,4 +1,8 @@
 #include "common.h"
+#include <sys/file.h>
+#include <time.h>
+
+#define SHM_READY_MAGIC 0x43484154u
 
 // global variables
 SharedSegment *shm_ptr;      
@@ -97,6 +101,7 @@ void *reader(void *arg) {
 
 int main(int argc, char *argv[]) {
     int shm_fd;
+    shm_ptr = NULL;
     pthread_t reader_tid;
     my_pid = getpid();
     
@@ -116,7 +121,8 @@ int main(int argc, char *argv[]) {
     shm_fd = shm_open(SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
 
     if (shm_fd != -1) {
-        // creator 
+        // Hold the advisory file lock until every shared mutex is ready.
+        if (flock(shm_fd, LOCK_EX) == -1) { perror("flock creator"); exit(1); }
         printf("Created Shared Memory Segment.\n");
         
         if (ftruncate(shm_fd, sizeof(SharedSegment)) == -1) { perror("ftruncate"); exit(1); }
@@ -153,6 +159,10 @@ int main(int argc, char *argv[]) {
         pthread_mutexattr_destroy(&mattr);
         pthread_condattr_destroy(&cattr);
 
+        // Publish readiness only after initialization is complete.
+        shm_ptr->initialized_magic = SHM_READY_MAGIC;
+        if (flock(shm_fd, LOCK_UN) == -1) { perror("flock unlock"); exit(1); }
+
         // enter the chat room I have selected
         pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
         pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
@@ -169,16 +179,46 @@ int main(int argc, char *argv[]) {
             shm_fd = shm_open(SHM_NAME, O_RDWR, 0600);
             if (shm_fd == -1) { perror("shm_open existing"); exit(1); }
 
-            struct stat shm_stat;
-            if (fstat(shm_fd, &shm_stat) == -1 ||
-                shm_stat.st_size != (off_t)sizeof(SharedSegment)) {
-                fprintf(stderr, "Shared memory segment is not initialized or has an invalid size. Try again.\n");
+            // Wait for creator initialization without touching uninitialized mutexes.
+            int ready = 0;
+            for (int attempt = 0; attempt < 40; attempt++) {
+                if (flock(shm_fd, LOCK_EX) == -1) { perror("flock joiner"); close(shm_fd); return 1; }
+
+                struct stat shm_stat;
+                if (fstat(shm_fd, &shm_stat) == -1) {
+                    perror("fstat");
+                    flock(shm_fd, LOCK_UN);
+                    close(shm_fd);
+                    return 1;
+                }
+
+                if (shm_stat.st_size == (off_t)sizeof(SharedSegment)) {
+                    if (!shm_ptr || shm_ptr == MAP_FAILED) {
+                        shm_ptr = mmap(NULL, sizeof(SharedSegment), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+                        if (shm_ptr == MAP_FAILED) { perror("mmap"); flock(shm_fd, LOCK_UN); close(shm_fd); return 1; }
+                    }
+                    if (shm_ptr->initialized_magic == SHM_READY_MAGIC) {
+                        ready = 1;
+                        flock(shm_fd, LOCK_UN);
+                        break;
+                    }
+                } else if (shm_stat.st_size != 0) {
+                    fprintf(stderr, "Incompatible shared memory size.\n");
+                    flock(shm_fd, LOCK_UN);
+                    close(shm_fd);
+                    return 1;
+                }
+
+                flock(shm_fd, LOCK_UN);
+                struct timespec pause_time = {.tv_sec = 0, .tv_nsec = 50000000};
+                nanosleep(&pause_time, NULL);
+            }
+            if (!ready) {
+                fprintf(stderr, "Shared memory initialization timed out.\n");
+                if (shm_ptr && shm_ptr != MAP_FAILED) munmap(shm_ptr, sizeof(SharedSegment));
                 close(shm_fd);
                 return 1;
             }
-
-            shm_ptr = mmap(NULL, sizeof(SharedSegment), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-            if (shm_ptr == MAP_FAILED) { perror("mmap"); exit(1); }
 
             // enter the chat room I have selected
             pthread_mutex_lock(&shm_ptr->lifecycle_mutex);

@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <errno.h>
+#include <stdint.h>
 
 #define SHM_NAME "/chat_app" // a constant name for all
 #define MSG_SIZE 128
@@ -40,6 +41,7 @@ typedef struct {
 // struct for shared memory
 // contains an array with all chat rooms
 typedef struct {
+    uint32_t initialized_magic;
     pthread_mutex_t lifecycle_mutex;
     int total_participants;
     ChatRoom rooms[MAX_ROOMS];
