@@ -40,6 +40,8 @@ typedef struct {
 // struct for shared memory
 // contains an array with all chat rooms
 typedef struct {
+    pthread_mutex_t lifecycle_mutex;
+    int total_participants;
     ChatRoom rooms[MAX_ROOMS];
 } SharedSegment;
 
