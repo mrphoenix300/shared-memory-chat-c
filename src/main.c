@@ -113,7 +113,7 @@ int main(int argc, char *argv[]) {
 
     // οpening shared memory (one for all)
     // we try to create the memory (O_CREAT)
-    shm_fd = shm_open(SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0666);
+    shm_fd = shm_open(SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
 
     if (shm_fd != -1) {
         // creator 
@@ -161,8 +161,16 @@ int main(int argc, char *argv[]) {
     } else {
         if (errno == EEXIST) {
             // joiner
-            shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+            shm_fd = shm_open(SHM_NAME, O_RDWR, 0600);
             if (shm_fd == -1) { perror("shm_open existing"); exit(1); }
+
+            struct stat shm_stat;
+            if (fstat(shm_fd, &shm_stat) == -1 ||
+                shm_stat.st_size != (off_t)sizeof(SharedSegment)) {
+                fprintf(stderr, "Shared memory segment is not initialized or has an invalid size. Try again.\n");
+                close(shm_fd);
+                return 1;
+            }
 
             shm_ptr = mmap(NULL, sizeof(SharedSegment), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
             if (shm_ptr == MAP_FAILED) { perror("mmap"); exit(1); }
