@@ -1,12 +1,14 @@
 #include "common.h"
 #include <sys/file.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <poll.h>
 
 #define SHM_READY_MAGIC 0x43484154u
 
 // global variables
 SharedSegment *shm_ptr;      
-volatile int running = 1;
+atomic_int running = 1;
 int my_pid;                 
 int current_room_id = 0; // which chat room we are in
 
@@ -32,15 +34,15 @@ void *reader(void *arg) {
     local_seq = myRoom->global_seq_count;
     pthread_mutex_unlock(&myRoom->mutex);
 
-    while (running) {
+    while (atomic_load(&running)) {
         pthread_mutex_lock(&myRoom->mutex); // enters critical section
 
         // wait for a new message to arrive
-        while (local_seq >= myRoom->global_seq_count && running) {
+        while (local_seq >= myRoom->global_seq_count && atomic_load(&running)) {
             pthread_cond_wait(&myRoom->new_msg_cond, &myRoom->mutex);
         }
 
-        if (!running) {
+        if (!atomic_load(&running)) {
             pthread_mutex_unlock(&myRoom->mutex);
             break;
         }
@@ -61,7 +63,7 @@ void *reader(void *arg) {
 
             if (strcmp(msg->payload, "TERMINATE") == 0) { // terminates when the user enter "TERMINATE" message
                 printf("\n[System]: Received TERMINATE signal in Room %d. Shutting down...\n", current_room_id);
-                running = 0; 
+                atomic_store(&running, 0); 
                 
                 if (msg->readers_left > 0) {
                     msg->readers_left--; // has been read
@@ -247,18 +249,35 @@ int main(int argc, char *argv[]) {
 
     printf("Chat active in Room %d. Type 'TERMINATE' to exit.\n", current_room_id);
 
-    while (running) {
-        printf("You (Room %d): ", current_room_id);
-        fflush(stdout);
+    printf("You (Room %d): ", current_room_id);
+    fflush(stdout);
 
+    while (atomic_load(&running)) {
+        // Check for peer shutdown while waiting for keyboard input.
+        // Unlike fgets alone, poll can wake periodically to observe running.
+        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
+        int poll_result = poll(&input, 1, 100);
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            perror("poll stdin");
+            break;
+        }
+        if (!atomic_load(&running)) break;
+        if (poll_result == 0) continue;
+        if (input.revents & (POLLERR | POLLNVAL)) break;
+        if (!(input.revents & (POLLIN | POLLHUP))) continue;
         if (fgets(buffer, MSG_SIZE, stdin) == NULL) break;
         buffer[strcspn(buffer, "\n")] = 0; 
 
-        if (strlen(buffer) == 0) continue;
+        if (strlen(buffer) == 0) {
+            printf("You (Room %d): ", current_room_id);
+            fflush(stdout);
+            continue;
+        }
 
         pthread_mutex_lock(&myRoom->mutex); // enters critical section
 
-        if (!running) {
+        if (!atomic_load(&running)) {
             pthread_mutex_unlock(&myRoom->mutex);
             break;
         }
@@ -266,12 +285,12 @@ int main(int argc, char *argv[]) {
         // check if full
         int idx = myRoom->head;
        // check if full and wait for readers
-        while (myRoom->messages[idx].readers_left > 0 && running) {
+        while (myRoom->messages[idx].readers_left > 0 && atomic_load(&running)) {
             // blocks until space_cond is signaled by a reader
             pthread_cond_wait(&myRoom->space_cond, &myRoom->mutex);
         }
 
-        if (!running) {
+        if (!atomic_load(&running)) {
             pthread_mutex_unlock(&myRoom->mutex);
             break;
         }
@@ -289,7 +308,7 @@ int main(int argc, char *argv[]) {
         myRoom->head = (myRoom->head + 1) % MAX_MSGS;
 
         if (strcmp(buffer, "TERMINATE") == 0) {
-            running = 0;
+            atomic_store(&running, 0);
             printf("[System]: You sent TERMINATE. Exiting...\n");
         }
 
@@ -297,10 +316,21 @@ int main(int argc, char *argv[]) {
         pthread_cond_broadcast(&myRoom->new_msg_cond);
 
         pthread_mutex_unlock(&myRoom->mutex); // leaves critical section
+
+        if (atomic_load(&running)) {
+            printf("You (Room %d): ", current_room_id);
+            fflush(stdout);
+        }
     }
 
-    // cleanup
-    pthread_cancel(reader_tid); 
+    // Tell the reader to stop and wake it even if no new messages arrive.
+    // Avoid pthread_cancel: cancellation in pthread_cond_wait can leave the
+    // process-shared room mutex locked during stack unwinding.
+    atomic_store(&running, 0);
+    pthread_mutex_lock(&myRoom->mutex);
+    pthread_cond_broadcast(&myRoom->new_msg_cond);
+    pthread_cond_broadcast(&myRoom->space_cond);
+    pthread_mutex_unlock(&myRoom->mutex);
     pthread_join(reader_tid, NULL);
 
     // Serialize joins and leaves across all rooms. The final participant
