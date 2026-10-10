@@ -249,10 +249,10 @@ int main(int argc, char *argv[]) {
 
     printf("Chat active in Room %d. Type 'TERMINATE' to exit.\n", current_room_id);
 
-    while (atomic_load(&running)) {
-        printf("You (Room %d): ", current_room_id);
-        fflush(stdout);
+    printf("You (Room %d): ", current_room_id);
+    fflush(stdout);
 
+    while (atomic_load(&running)) {
         // Check for peer shutdown while waiting for keyboard input.
         // Unlike fgets alone, poll can wake periodically to observe running.
         struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
@@ -269,7 +269,11 @@ int main(int argc, char *argv[]) {
         if (fgets(buffer, MSG_SIZE, stdin) == NULL) break;
         buffer[strcspn(buffer, "\n")] = 0; 
 
-        if (strlen(buffer) == 0) continue;
+        if (strlen(buffer) == 0) {
+            printf("You (Room %d): ", current_room_id);
+            fflush(stdout);
+            continue;
+        }
 
         pthread_mutex_lock(&myRoom->mutex); // enters critical section
 
@@ -312,6 +316,11 @@ int main(int argc, char *argv[]) {
         pthread_cond_broadcast(&myRoom->new_msg_cond);
 
         pthread_mutex_unlock(&myRoom->mutex); // leaves critical section
+
+        if (atomic_load(&running)) {
+            printf("You (Room %d): ", current_room_id);
+            fflush(stdout);
+        }
     }
 
     // Tell the reader to stop and wake it even if no new messages arrive.
