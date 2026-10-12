@@ -9,6 +9,7 @@
 // global variables
 SharedSegment *shm_ptr;      
 atomic_int running = 1;
+atomic_int last_read_seq = 0; // last sequence accounted for by this participant
 int my_pid;                 
 int current_room_id = 0; // which chat room we are in
 
@@ -31,7 +32,7 @@ void *reader(void *arg) {
 
     // initial synchronization
     pthread_mutex_lock(&myRoom->mutex);
-    local_seq = myRoom->global_seq_count;
+    local_seq = atomic_load(&last_read_seq);
     pthread_mutex_unlock(&myRoom->mutex);
 
     while (atomic_load(&running)) {
@@ -73,6 +74,7 @@ void *reader(void *arg) {
                 }
                 
                 // wake up others just in case they are stuck waiting
+                atomic_store(&last_read_seq, target_id);
                 pthread_cond_broadcast(&myRoom->new_msg_cond);
                 pthread_mutex_unlock(&myRoom->mutex);
                 pthread_exit(NULL);
@@ -84,8 +86,8 @@ void *reader(void *arg) {
                 fflush(stdout);
             }
 
-            if (msg->readers_left > 0) {
-                msg->readers_left--; // has been read
+            if (msg->sender_pid != my_pid && msg->readers_left > 0) {
+                msg->readers_left--; // counted recipients only
                 if (msg->readers_left == 0) {
                     pthread_cond_signal(&myRoom->space_cond); // notify writer that space is free
                 }
@@ -96,6 +98,7 @@ void *reader(void *arg) {
             local_seq++;
         }
         
+        atomic_store(&last_read_seq, local_seq);
         pthread_mutex_unlock(&myRoom->mutex); // leaves critical section
     }
     return NULL;
@@ -168,6 +171,7 @@ int main(int argc, char *argv[]) {
         // enter the chat room I have selected
         pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
         pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
+        atomic_store(&last_read_seq, shm_ptr->rooms[current_room_id].global_seq_count);
         shm_ptr->rooms[current_room_id].active_participants++;
         shm_ptr->total_participants++;
         pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);
@@ -225,6 +229,7 @@ int main(int argc, char *argv[]) {
             // enter the chat room I have selected
             pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
             pthread_mutex_lock(&shm_ptr->rooms[current_room_id].mutex);
+            atomic_store(&last_read_seq, shm_ptr->rooms[current_room_id].global_seq_count);
             shm_ptr->rooms[current_room_id].active_participants++;
             shm_ptr->total_participants++;
             pthread_mutex_unlock(&shm_ptr->rooms[current_room_id].mutex);
@@ -337,6 +342,19 @@ int main(int argc, char *argv[]) {
     // unlinks while holding the lifecycle lock, preventing concurrent joins.
     pthread_mutex_lock(&shm_ptr->lifecycle_mutex);
     pthread_mutex_lock(&myRoom->mutex);
+    // This participant no longer exists: release every unread delivery it
+    // was counted for, so the circular buffer does not remain permanently full.
+    int last_seen = atomic_load(&last_read_seq);
+    for (int i = 0; i < MAX_MSGS; i++) {
+        Message *msg = &myRoom->messages[i];
+        if (msg->id > last_seen && msg->sender_pid != my_pid &&
+            msg->readers_left > 0) {
+            msg->readers_left--;
+            if (msg->readers_left == 0) {
+                pthread_cond_broadcast(&myRoom->space_cond);
+            }
+        }
+    }
     myRoom->active_participants--;
     pthread_mutex_unlock(&myRoom->mutex);
     shm_ptr->total_participants--;
